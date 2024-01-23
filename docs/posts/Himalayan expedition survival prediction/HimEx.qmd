@@ -1,0 +1,8 @@
+---
+title: "Himalayan Expedition Survival Prediction"
+description: "An analysis of survival prediction in Himalayan expeditions."
+---
+
+```{=html}
+<iframe src="Himalayandeaths.html" width="800%" height="800px">
+</iframe>

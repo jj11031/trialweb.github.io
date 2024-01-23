@@ -1,0 +1,228 @@
+---
+title: "Multinomial Volcano Classification project"
+author: Jayjit Das
+code-fold: true
+code-tools: true
+format:
+  html:
+    toc: true
+    warning: false
+---
+
+# Goal: To build a multiclass classification model to predict type of volcano.
+
+Our objective in modeling is to forecast the category of volcanoes in this week's #TidyTuesday dataset, relying on various volcano characteristics such as latitude, longitude, tectonic setting, etc. Since there are more than two volcano types, this task falls under the category of multiclass or multinomial classification rather than binary classification.
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+volcano_raw <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-05-12/volcano.csv")
+
+volcano_raw %>%
+  count(primary_volcano_type, sort = TRUE)
+
+```
+
+Given the abundance of volcano types and our limited dataset of only 958 examples, building a model for each type might be challenging. Instead, let's simplify the task by creating a new variable named **`volcano_type`** and focus on distinguishing between three main types:
+
+1.  Stratovolcano
+
+2.  Shield volcano
+
+3.  Everything else (other)
+
+As we employ the **`transmute()`** function to generate this new variable, let's also choose the specific variables relevant for modeling. These variables will include information about the tectonics surrounding the volcano and the most crucial rock type.
+
+```{r}
+volcano_df <- volcano_raw %>%
+  transmute(
+    volcano_type = case_when(
+      str_detect(primary_volcano_type, "Stratovolcano") ~ "Stratovolcano",
+      str_detect(primary_volcano_type, "Shield") ~ "Shield",
+      TRUE ~ "Other"
+    ),
+    volcano_number, latitude, longitude, elevation,
+    tectonic_settings, major_rock_1
+  ) %>%
+  mutate_if(is.character, factor)
+
+volcano_df %>%
+  count(volcano_type, sort = TRUE)
+```
+
+We will be building a multiclass predictive model since the papers are categorized into three groups: finance, microeconomics, and macroeconomics. Unlike the common use of binary classification models, our objective involves predicting among multiple classes. Before diving into the modeling process, let's generate an exploratory plot.
+
+Visualizing the distribution of various volcano types.
+
+```{r}
+world <- map_data("world")
+
+ggplot() +
+  geom_map(
+    data = world, map = world,
+    aes(long, lat, map_id = region),
+    color = "white", fill = "gray50", size = 0.05, alpha = 0.2
+  ) +
+  geom_point(
+    data = volcano_df,
+    aes(longitude, latitude, color = volcano_type),
+    alpha = 0.8
+  ) +
+  theme_void(base_family = "IBMPlexSans") +
+  labs(x = NULL, y = NULL, color = NULL)
+```
+
+These type of relationships between category and title words are what we want to use in our predictive model.
+
+## Building a model
+
+Instead of dividing this relatively small dataset into training and testing data, a set of bootstrap resamples will be generated.
+
+```{r}
+library(tidymodels)
+volcano_boot <- bootstraps(volcano_df)
+
+volcano_boot
+```
+
+Our multinomial classification model will be trained on these resamples. Next, our data will be preprocessed using a recipe. Considering the substantial imbalance with significantly fewer shield volcanoes compared to the other groups, SMOTE upsampling (via the themis package) will be applied to balance the classes.
+
+```{r}
+
+library(themis)
+
+volcano_rec <- recipe(volcano_type ~ ., data = volcano_df) %>%
+  update_role(volcano_number, new_role = "Id") %>%
+  step_other(tectonic_settings) %>%
+  step_other(major_rock_1) %>%
+  step_dummy(tectonic_settings, major_rock_1) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors()) %>%
+  step_smote(volcano_type)
+
+```
+
+1.  First, the **`recipe()`** function needs to be informed about the model using a formula and the data it will work with.
+
+2.  Following that, an update is made to the role of the volcano number, designating it as a variable to retain for convenience as an identifier for rows, although it is neither a predictor nor an outcome.
+
+3.  Considering the numerous tectonic settings and rocks in the dataset, less frequently occurring levels are combined into an "Other" category for each predictor.
+
+4.  Subsequently, indicator variables are created, and those with zero variance are removed.
+
+5.  Prior to oversampling, all predictors are centered and scaled (normalized).
+
+6.  Lastly, SMOTE oversampling is implemented to ensure balance among the volcano types.
+
+```{r}
+volcano_prep <- prep(volcano_rec)
+juice(volcano_prep)
+```
+
+Before utilizing **`prep()`**, the defined steps have been outlined but not executed. The evaluation of these steps takes place within the **`prep()`** function. The **`juice()`** function can then be employed to retrieve the preprocessed data and inspect the results.
+
+Now, the model specification is the focus. In this example, a **`workflow()`** is used for convenience. Workflows are objects designed to facilitate the management of modeling pipelines, with components that seamlessly fit together like Lego blocks. This particular **`workflow()`** includes both the recipe and the model, specifically a random forest classifier. The ranger implementation for random forests can handle multinomial classification without requiring any special handling.
+
+```{r}
+rf_spec <- rand_forest(trees = 1000) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+volcano_wf <- workflow() %>%
+  add_recipe(volcano_rec) %>%
+  add_model(rf_spec)
+
+volcano_wf
+```
+
+Fitting workflow to our resamples.
+
+```{r}
+volcano_res <- fit_resamples(
+  volcano_wf,
+  resamples = volcano_boot,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+## Exploring results
+
+A significant distinction when dealing with multiclass problems lies in the utilization of different performance metrics. The yardstick package offers implementations for a variety of multiclass metrics.
+
+```{r}
+volcano_res %>%
+  collect_metrics()
+```
+
+A confusion matrix can be generated to assess the performance of the various classes.
+
+```{r}
+volcano_res %>%
+  collect_predictions() %>%
+  conf_mat(volcano_type, .pred_class)
+```
+
+Even with the application of SMOTE oversampling, identifying stratovolcanoes remains relatively straightforward.
+
+While accuracy and AUC were computed during fit_resamples(), it's possible to revisit and calculate additional metrics of interest if the predictions were saved. Additionally, using group_by() on resamples allows for further analysis. Perform the same actions again.
+
+```{r}
+volcano_res %>%
+  collect_predictions() %>%
+  group_by(id) %>%
+  ppv(volcano_type, .pred_class)
+```
+
+Exploring some variable importance.
+
+```{r}
+library(vip)
+
+rf_spec %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(
+    volcano_type ~ .,
+    data = juice(volcano_prep) %>%
+      select(-volcano_number) %>%
+      janitor::clean_names()
+  ) %>%
+  vip(geom = "point")
+
+
+```
+
+The spatial information holds significant importance for the model, with the presence of basalt being the next crucial factor. To delve deeper into the spatial information, let's further explore it and create a map illustrating the accuracy or inaccuracy of our modeling across the world. We can achieve this by rejoining the predictions back to the original data. Repeat this process once again.
+
+```{r}
+volcano_pred <- volcano_res %>%
+  collect_predictions() %>%
+  mutate(correct = volcano_type == .pred_class) %>%
+  left_join(volcano_df %>%
+    mutate(.row = row_number()))
+
+volcano_pred
+```
+
+Next, let's generate a map using **`stat_summary_hex()`**. Within each hexagon, we'll calculate the mean of correctness to determine the percentage of volcanoes that were classified correctly across all our bootstrap resamples.
+
+### Visualization:
+
+```{r}
+ggplot() +
+  geom_map(
+    data = world, map = world,
+    aes(long, lat, map_id = region),
+    color = "white", fill = "grey90", size = 0.05, alpha = 0.5
+  ) +
+  stat_summary_hex(
+    data = volcano_pred,
+    aes(longitude, latitude, z = as.integer(correct)),
+    fun = "mean",
+    alpha = 0.7, bins = 50
+  ) +
+  scale_fill_gradient(high = "red", labels = scales::percent) +
+  theme_void(base_family = "IBMPlexSans") +
+  labs(x = NULL, y = NULL, fill = "Percent classified\ncorrectly")
+```
